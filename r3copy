@@ -1,0 +1,495 @@
+#!/bin/bash
+#
+# script nuevo r3copy
+# 
+# version 0.1 2013-03-15 - solo recrea controlfile para instancias ASM
+#
+# Descripcion: script R3Copy nuevo que contempla la posibilidad de que se use ASM y que recrea los threads RAC 
+#
+# Uso: r3copy -o SID_ORIGEN -d SID_DESTINO, se lanza con usuario "orasid", donde sid es SID_ORIGEN
+#
+# Ejemplo: r3copy -o EF3 -d EF5
+#
+# Licencia:
+#
+# Copyright 2013 Jordi Molina Casas warp3r@gmail.com
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+# RETCODES
+export RETCODE_OK=0
+export RETCODE_PARAMETROS=1
+export RETCODE_ORIGEN_NOT_RUNNING=2
+export RETCODE_ORIGEN_NOT_HERE=3
+export RETCODE_RAC11G_ENV_NOT_LOADED=5
+export RETCODE_WRONG_USER=6
+export RETCODE_CONTROLFILE_EXISTS=7
+
+# init vars
+SID_ORIGEN=" "
+SID_DESTINO=" "
+ASM_STORAGE=0
+
+# Funciones de ayuda
+Uso()
+{
+	echo "Uso $1 -o SID_ORIGEN -d SID_DESTINO"
+	echo "Se debe lanzar con usuario orasid, onde sid es SID_ORIGEN"
+	exit $RETCODE_PARAMETROS
+}
+
+SalidaError()
+{
+	echo "Error: $1"
+	exit $2
+}
+
+# Funciones para la creacion del controlfile
+
+# Cabecera()
+# Genera la cabecera del controlfile
+# Parametros:
+#   $1 SID ORIGEN
+#   $2 SID DESTINO
+#
+Cabecera()
+{
+	sid_origen=$1
+	sid_destino=$2
+	echo "-- Controlfile para refresco de ${sid_destino} desde ${sid_origen}"
+	echo "-- creado: $(date)"
+	echo "STARTUP NOMOUNT"
+	echo "CREATE CONTROLFILE SET DATABASE \"${sid_destino}\" RESETLOGS NOARCHIVELOG"
+	echo "    MAXLOGFILES 255"
+	echo "    MAXLOGMEMBERS 3"
+	echo "    MAXDATAFILES 254"
+	echo "    MAXINSTANCES 50"
+	echo "    MAXLOGHISTORY 11685"
+}
+
+# LogfileInicial()
+# Genera los comandos para el logfile inicial (del thread 1)
+# Parametros:
+#    $1 SID ORIGEN
+#    $2 SID DESTINO
+#    $3 ASM? (1=si, 0=no)
+#
+LogfileInicial()
+{
+	sid_origen=$1
+        sid_destino=$2
+	asm_storage=$3
+	tmp_origen="/tmp/tmp_control_logfiles_${sid_origen}.tmp"
+	tmp_destino="/tmp/tmp_control_logfiles_${sid_destino}.tmp"
+	sql="/tmp/tmp_sql.sql"
+	# Limpieza otras ejecuciones
+	for i in $tmp_origen $tmp_destino $sql
+	do
+		if [ -f $i ]
+		then
+			rm -f $i
+		fi
+	done
+	# Generamos las sentencias
+        echo "SET PAGESIZE 0" > $sql
+        echo "SET FEEDBACK OFF" >> $sql
+        echo "SET VERIFY OFF" >> $sql
+        echo "SET TERMOUT OFF" >> $sql
+        echo "spool $tmp_destino" >> $sql
+        echo "col maxlog new_value maxlog;" >> $sql
+	echo "select max(group#) maxlog from v\$log where thread#=1;" >> $sql
+	if [ $asm_storage -eq 1 ]
+	then
+		# proceso para ASM
+		echo "select '    GROUP ' || group# || '(''' || '+${sid_destino}' || '_OLOG'',''' || '+${sid_destino}' || '_MLOG'') SIZE ' || bytes/1024/1024 || 'M,' from v\$log where thread#=1 and group# < &maxlog;" >> $sql
+		echo "select '    GROUP ' || group# || '(''' || '+${sid_destino}' || '_OLOG'',''' || '+${sid_destino}' || '_MLOG'') SIZE ' || bytes/1024/1024 || 'M' from v\$log where thread#=1 and group#=&maxlog;" >> $sql
+	else
+		# proceso para filesystem
+		# OJO! PENDIENTE!
+		echo "select '    GROUP ' || group# || '(''' || '+${sid_destino}' || '_OLOG'',''' || '+${sid_destino}' || '_MLOG'') SIZE ' ||                 bytes/1024/1024 || ',' from v\$log where thread#=1 and group# < &maxlog;" >> $sql
+                echo "select '    GROUP ' || group# || '(''' || '+${sid_destino}' || '_OLOG'',''' || '+${sid_destino}' || '_MLOG'') SIZE ' ||                 bytes/1024/1024 from v\$log where thread#=1 and group#=&maxlog;" >> $sql
+	fi
+	echo "spool off" >> $sql
+	echo "exit" >> $sql
+	# ejecutamos las sentencias
+	sqlplus -S / as sysdba @$sql
+	# devolvemos los valores
+	echo "LOGFILE"
+	cat $tmp_destino | sed -e "1d"
+
+	# limpiamos
+	for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+# DataFiles()
+# Genera los comandos para los datafiles
+# Parametros:
+#    $1 SID ORIGEN
+#    $2 SID DESTINO
+#    $3 ASM? (1=si, 0=no)
+#
+DataFiles()
+{
+        sid_origen=$1
+        sid_destino=$2
+        asm_storage=$3
+        tmp_origen="/tmp/tmp_control_datafiles_${sid_origen}.tmp"
+        tmp_destino="/tmp/tmp_control_datafiles_${sid_destino}.tmp"
+        sql="/tmp/tmp_sql_datafiles.sql"
+        # Limpieza otras ejecuciones
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+        # Generamos las sentencias
+        echo "SET PAGESIZE 0" > $sql
+        echo "SET FEEDBACK OFF" >> $sql
+        echo "SET VERIFY OFF" >> $sql
+        echo "SET TERMOUT OFF" >> $sql
+        echo "spool $tmp_origen" >> $sql
+        echo "COL MAXDATA new_value MAXDATA;" >> $sql
+        echo "SELECT MAX(FILE#) MAXDATA FROM v\$datafile;" >> $sql
+        if [ $asm_storage -eq 1 ]
+        then
+                # proceso para ASM
+                echo "SELECT '    ''' || NAME || '''' || ', ' FROM v\$datafile WHERE FILE# < &MAXDATA;" >> $sql
+                echo "SELECT '    ''' || NAME || '''' FROM v\$datafile WHERE FILE# = &MAXDATA;" >> $sql
+        else
+                # proceso para filesystem
+                # OJO! PENDIENTE!
+		echo "SELECT '    ''' || NAME || '''' || ', ' FROM v\$datafile WHERE FILE# < &MAXDATA;" >> $sql
+		echo "SELECT '    ''' || NAME || '''' FROM v\$datafile WHERE FILE# = &MAXDATA;" >> $sql
+        fi
+        echo "spool off" >> $sql
+        echo "exit" >> $sql
+        # ejecutamos las sentencias
+        sqlplus -S / as sysdba @$sql
+	# convertimos los valores de origen a destino
+	if [ $asm_storage -eq 1 ]
+	then
+		# proceso para ASM
+		sed "s/${sid_origen}_/${sid_destino}_/g" $tmp_origen > $tmp_destino
+	fi
+        # devolvemos los valores
+        echo "DATAFILES"
+        cat $tmp_destino | sed -e "1d"
+
+        # limpiamos
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+# Funcion CharacterSet()
+#
+# Genera el codigo para la config del character set de la BBDD y cierra el create database
+# No tiene parametros
+CharacterSet()
+{
+	tmp_destino="/tmp/tmp_control_charset_${sid_destino}.tmp"
+	sql="/tmp/tmp_sql_charset.sql"
+	# Limpieza otras ejecuciones
+        for i in $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+	echo "SET PAGESIZE 0" > $sql
+        echo "SET FEEDBACK OFF" >> $sql
+        echo "SET VERIFY OFF" >> $sql
+        echo "SET TERMOUT OFF" >> $sql
+        echo "spool $tmp_destino" >> $sql
+	echo "select 'CHARACTER SET ' || VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_CHARACTERSET';" >> $sql
+	echo "spool off" >> $sql
+	echo "exit" >> $sql
+	
+	# ejecutamos las sentencias
+	sqlplus -S / as sysdba @$sql
+
+	# devolvemos los valores
+	cat $tmp_destino
+	echo ";"
+        # limpiamos
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+# RestoLogfiles()
+#
+# Función que crea el resto de logfiles, en caso de que haya más de un thread (RAC)
+# Parámetros:
+#    $1 SID ORIGEN
+#    $2 SID DESTINO
+#    $3 ASM? (1=si, 0=no)
+#
+RestoLogfiles()
+{
+        sid_origen=$1
+        sid_destino=$2
+        asm_storage=$3
+        tmp_origen="/tmp/tmp_control_raclogfiles_${sid_origen}.tmp"
+        tmp_destino="/tmp/tmp_control_raclogfiles_${sid_destino}.tmp"
+        sql="/tmp/tmp_sql_raclogfiles.sql"
+	
+	# Limpieza otras ejecuciones
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+
+        # Generamos las sentencias
+        echo "SET PAGESIZE 0" > $sql
+        echo "SET FEEDBACK OFF" >> $sql
+        echo "SET VERIFY OFF" >> $sql
+        echo "SET TERMOUT OFF" >> $sql
+	echo "set serveroutput on;" >> $sql
+        echo "spool $tmp_destino" >> $sql
+
+        if [ $asm_storage -eq 1 ]
+        then
+                # proceso para ASM
+		echo "begin" >> $sql
+		echo "for thread in (select distinct thread# from v\$log where thread#<>1)" >> $sql
+		echo "loop" >> $sql
+		echo "    dbms_output.put_line('ALTER DATABASE ADD LOGFILE THREAD ' || thread.thread#);" >> $sql
+		echo "    for groupmember in (select group#, bytes" >> $sql
+		echo "                        from v\$log where thread#=thread.thread#" >> $sql
+		echo "                        and group# < (select max(group#) maxlog" >> $sql
+		echo "                                      from v\$log where thread#=thread.thread#)" >> $sql
+		echo "                        )" >> $sql
+		echo "     loop" >> $sql
+		echo "         dbms_output.put_line(chr(9) || 'GROUP ' || groupmember.group# || ' (''' || '+$sid_destino' || '_OLOG'',''' || '+$sid_destino' || '_MLOG'') SIZE ' || groupmember.bytes/1024/1024 || 'M,');" >> $sql
+		echo "     end loop;" >> $sql
+		echo "     for groupmember in (select group#, bytes" >> $sql
+		echo "                         from v\$log where thread#=thread.thread#" >> $sql
+		echo "                         and group# = (select max(group#) maxlog" >> $sql
+		echo "                                       from v\$log where thread#=thread.thread#)" >> $sql
+		echo "                         )" >> $sql
+		echo "     loop" >> $sql
+		echo "         dbms_output.put_line(chr(9) || 'GROUP ' || groupmember.group# || ' (''' || '+$sid_destino' || '_OLOG'',''' || '+$sid_destino' || '_MLOG'') SIZE ' || groupmember.bytes/1024/1024 || 'M;');" >> $sql
+		echo "     end loop;" >> $sql
+		echo "end loop;" >> $sql
+		echo "end;" >> $sql
+		echo "/" >> $sql
+		echo "set serveroutput off;" >> $sql
+        else
+                # proceso para filesystem
+                # OJO! PENDIENTE!
+                echo "kk;" >> $sql
+        fi
+	echo "spool off" >> $sql
+	echo "exit" >> $sql
+        # ejecutamos las sentencias
+        sqlplus -S / as sysdba @$sql
+	# sacamos el output
+	cat $tmp_destino
+
+	# Limpieza 
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+# Funcion OpenResetlogs()
+#
+# Abre la base de datos con resetlogs
+# No tiene parametros
+OpenResetlogs()
+{
+	tmp_destino="/tmp/tmp_control_openresetlogs_${sid_destino}.tmp"
+	# Limpieza otras ejecuciones
+        for i in $tmp_destino 
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+	echo "-- Abrimos la bbdd reiniciando redo logs" > $tmp_destino
+	echo "ALTER DATABASE OPEN RESETLOGS;" >> $tmp_destino
+	
+	# devolvemos los valores
+	cat $tmp_destino
+
+        # limpiamos
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+# Funcion TempFiles()
+#
+# Crea el codigo que añade los tempfiles con reuse
+# Parámetros:
+#    $1 SID ORIGEN
+#    $2 SID DESTINO
+#    $3 ASM? (1=si, 0=no)
+#
+TempFiles()
+{
+        sid_origen=$1
+        sid_destino=$2
+        asm_storage=$3
+        tmp_origen="/tmp/tmp_control_tempfiles_${sid_origen}.tmp"
+        tmp_destino="/tmp/tmp_control_tempfiles_${sid_destino}.tmp"
+        sql="/tmp/tmp_sql_tempfiles.sql"
+        # Limpieza otras ejecuciones
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+        # Generamos las sentencias
+        echo "SET PAGESIZE 0" > $sql
+        echo "SET FEEDBACK OFF" >> $sql
+        echo "SET VERIFY OFF" >> $sql
+        echo "SET LINESIZE 240" >> $sql
+        echo "SET TERMOUT OFF" >> $sql
+        echo "spool $tmp_origen" >> $sql
+        echo "SELECT 'alter tablespace PSAPTEMP add tempfile ' || '''' || NAME || '''' || ' reuse; '" >> $sql
+        echo "FROM v\$tempfile ORDER BY file#;" >> $sql
+        echo "spool off" >> $sql
+        echo "exit" >> $sql
+        # ejecutamos las sentencias
+        sqlplus -S / as sysdba @$sql
+        # convertimos los valores de origen a destino
+        if [ $asm_storage -eq 1 ]
+        then
+                # proceso para ASM
+                sed "s/${sid_origen}_/${sid_destino}_/g" $tmp_origen > $tmp_destino
+        fi
+        # devolvemos los valores
+        echo "-- Añadimos tempfiles con reuse"
+	cat $tmp_destino 
+
+        # limpiamos
+        for i in $tmp_origen $tmp_destino $sql
+        do
+                if [ -f $i ]
+                then
+                        rm -f $i
+                fi
+        done
+}
+
+
+TOTAL=0
+while getopts "o:d:?" name
+do
+	case $name in
+		o)
+			SID_ORIGEN=$OPTARG ;;
+		d)
+			SID_DESTINO=$OPTARG ;;
+		?)
+			Uso $(basename $0) ;;
+	esac
+done
+
+# Saneamiento de variables
+# 
+# Se comprueba que las dos variables sean de 3 caracteres (como los sid de oracle)
+if [ "${#SID_ORIGEN}" -ne 3 -o  "${#SID_DESTINO}" -ne 3 ]
+then
+	Uso $(basename $0)
+fi
+
+# Adaptación variables
+SID_ORIGEN_MINUSCULAS=$(echo ${SID_ORIGEN} | tr [A-Z] [a-z])
+SID_DESTINO_MINUSCULAS=$(echo ${SID_DESTINO} | tr [A-Z] [a-z])
+
+# Verificacion sid origen
+#
+# Se verifica que el usuario de la bbdd origen existe
+if [ $(grep -c ora${SID_ORIGEN_MINUSCULAS} /etc/passwd) -eq 0 ]
+then
+        SalidaError "El usuario ora${SID_ORIGEN_MINUSCULAS} parece no existir en este servidor." $RETCODE_ORIGEN_NOT_HERE
+fi
+
+# Se verifica que el SID origen esté activo en esta máquina
+if [ $(ps -fu ora${SID_ORIGEN_MINUSCULAS} | grep ${SID_ORIGEN} | grep -c pmon) -eq 0 ]
+then
+	SalidaError "La base de datos origen ${SID_ORIGEN} no parece estar activa en este servidor." $RETCODE_ORIGEN_NOT_RUNNING
+fi
+
+# Comprobamos si estamos logados como usuario orasid
+if [ ${USER} != "ora${SID_ORIGEN_MINUSCULAS}" ]
+then
+	# comprobamos si estamos como user oracle, por si es un entorno RAC 11g de user unico
+	# y validamos que este cargado el entorno de la bbdd
+	if [ ${USER} == "oracle"  ]
+	then
+		# el usuario es oracle, ponemos la variable ASM_STORAGE a 1 y si el entorno no esta cargado salimos con error
+		if [ $(echo ${ORACLE_SID} | grep -c ${SID_ORIGEN}) -eq 1 ]
+		then
+			ASM_STORAGE=1
+		else
+			SalidaError "Estas usando el usuario oracle de un RAC 11g pero no has cargado el entorno de la BBDD Origen" $RETCODE_RAC11G_ENV_NOT_LOADED
+		fi
+	else
+		SalidaError "Usuario incorrecto. Debes lanzar r3copy como orasid (10g,10gRAC,11g No RAC) o como oracle (11g RAC)" $RETCODE_WRONG_USER 
+	fi
+fi
+
+# a partir de este momento, tenemos todo lo necesario para crear el controlfile
+# definimos variables para la salida de fichero
+OUTPUT_CONTROLFILE="/tmp/controlfile_${SID_DESTINO}_$(date +%y%m%d).sql"
+if [ -f ${OUTPUT_CONTROLFILE} ]
+then
+	SalidaError "El fichero del controlfile ya existe. Si es erróneo bórralo para poder crear uno nuevo" $RETCODE_CONTROLFILE_EXISTS
+fi	
+
+Cabecera "${SID_ORIGEN}" "${SID_DESTINO}" > ${OUTPUT_CONTROLFILE} 
+LogfileInicial "${SID_ORIGEN}" "${SID_DESTINO}" ${ASM_STORAGE} >> ${OUTPUT_CONTROLFILE}
+DataFiles "${SID_ORIGEN}" "${SID_DESTINO}" ${ASM_STORAGE} >> ${OUTPUT_CONTROLFILE}
+CharacterSet >> ${OUTPUT_CONTROLFILE}
+RestoLogfiles "${SID_ORIGEN}" "${SID_DESTINO}" ${ASM_STORAGE} >> ${OUTPUT_CONTROLFILE}
+OpenResetlogs >> ${OUTPUT_CONTROLFILE}
+TempFiles "${SID_ORIGEN}" "${SID_DESTINO}" ${ASM_STORAGE} >> ${OUTPUT_CONTROLFILE}
+
+echo "El control file se ha dejado en ${OUTPUT_CONTROLFILE}"
+exit ${RETCODE_OK}
